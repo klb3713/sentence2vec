@@ -778,8 +778,8 @@ class Word2Vec(utils.SaveLoad):
 
 
 class Sent2Vec(utils.SaveLoad):
-    def __init__(self, sentences, model_file=None, alpha=0.025, window=5,
-                sample=0, seed=1, workers=1, min_alpha=0.0001, sg=1, hs=1, negative=0, cbow_mean=0):
+    def __init__(self, sentences, model_file=None, alpha=0.025, window=5, sample=0, seed=1,
+        workers=1, min_alpha=0.0001, sg=1, hs=1, negative=0, cbow_mean=0, iteration=1):
         self.sg = int(sg)
         self.table = None # for negative sampling --> this needs a lot of RAM! consider setting back to None before saving
         self.alpha = float(alpha)
@@ -797,7 +797,8 @@ class Sent2Vec(utils.SaveLoad):
             self.vocab = self.w2v.vocab
             self.layer1_size = self.w2v.layer1_size
             self.reset_sent_vec(sentences)
-            self.train_sent(sentences)
+            for i in range(iteration):
+                self.train_sent(sentences)
 
     def reset_sent_vec(self, sentences):
         """Reset all projection weights to an initial (untrained) state, but keep the existing vocabulary."""
@@ -841,7 +842,12 @@ class Sent2Vec(utils.SaveLoad):
                     break
                     # update the learning rate before every job
                 alpha = max(self.min_alpha, self.alpha * (1 - 1.0 * word_count[0] / total_words))
-                job_words = sum(self.train_sent_vec_cbow(self.w2v, sent_no, sentence, alpha, work, neu1) for sent_no, sentence in job)
+                if self.sg:
+                    job_words = sum(self.train_sent_vec_sg(self.w2v, sent_no, sentence, alpha, work)
+                                    for sent_no, sentence in job)
+                else:
+                    job_words = sum(self.train_sent_vec_cbow(self.w2v, sent_no, sentence, alpha, work, neu1)
+                                    for sent_no, sentence in job)
                 with lock:
                     word_count[0] += job_words
                     elapsed = time.time() - start
@@ -934,6 +940,62 @@ class Sent2Vec(utils.SaveLoad):
 
         return len([word for word in sentence if word is not None])
 
+    def train_sent_vec_sg(self, model, sent_no, sentence, alpha, work=None):
+        """
+        Update skip-gram model by training on a single sentence.
+
+        The sentence is a list of Vocab objects (or None, where the corresponding
+        word is not in the vocabulary. Called internally from `Word2Vec.train()`.
+
+        This is the non-optimized, Python version. If you have cython installed, gensim
+        will use the optimized version from word2vec_inner instead.
+
+        """
+        if self.negative:
+            # precompute negative labels
+            labels = zeros(self.negative + 1)
+            labels[0] = 1.0
+
+        for pos, word in enumerate(sentence):
+            if word is None:
+                continue  # OOV word in the input sentence => skip
+            reduced_window = random.randint(model.window)  # `b` in the original word2vec code
+
+            # now go over all words from the (reduced) window, predicting each one in turn
+            start = max(0, pos - model.window + reduced_window)
+            for pos2, word2 in enumerate(sentence[start : pos + model.window + 1 - reduced_window], start):
+                # don't train on OOV words and on the `word` itself
+                if word2:
+                    # l1 = model.syn0[word.index]
+                    l1 = self.sents[sent_no]
+                    neu1e = zeros(l1.shape)
+
+                    if model.hs:
+                        # work on the entire tree at once, to push as much work into numpy's C routines as possible (performance)
+                        l2a = deepcopy(model.syn1[word2.point])  # 2d matrix, codelen x layer1_size
+                        fa = 1.0 / (1.0 + exp(-dot(l1, l2a.T)))  #  propagate hidden -> output
+                        ga = (1 - word2.code - fa) * alpha  # vector of error gradients multiplied by the learning rate
+                        # model.syn1[word2.point] += outer(ga, l1)  # learn hidden -> output
+                        neu1e += dot(ga, l2a) # save error
+
+                    if model.negative:
+                        # use this word (label = 1) + `negative` other random words not from this sentence (label = 0)
+                        word_indices = [word2.index]
+                        while len(word_indices) < model.negative + 1:
+                            w = model.table[random.randint(model.table.shape[0])]
+                            if w != word2.index:
+                                word_indices.append(w)
+                        l2b = model.syn1neg[word_indices] # 2d matrix, k+1 x layer1_size
+                        fb = 1. / (1. + exp(-dot(l1, l2b.T))) # propagate hidden -> output
+                        gb = (labels - fb) * alpha # vector of error gradients multiplied by the learning rate
+                        # model.syn1neg[word_indices] += outer(gb, l1) # learn hidden -> output
+                        neu1e += dot(gb, l2b) # save error
+
+                    # model.syn0[word.index] += neu1e  # learn input -> hidden
+                    self.sents[sent_no] += neu1e  # learn input -> hidden
+
+        return len([word for word in sentence if word is not None])
+
     def save_sent2vec_format(self, fname):
         """
         Store the input-hidden weight matrix in the same format used by the original
@@ -948,6 +1010,22 @@ class Sent2Vec(utils.SaveLoad):
             for sent_no in xrange(self.sents_len):
                 row = self.sents[sent_no]
                 fout.write(utils.to_utf8("sent_%d %s\n" % (sent_no, ' '.join("%f" % val for val in row))))
+
+    def similarity(self, sent1, sent2):
+        """
+        Compute cosine similarity between two sentences. sent1 and sent2 are
+        the indexs in the train file.
+
+        Example::
+
+          >>> trained_model.similarity(0, 0)
+          1.0
+
+          >>> trained_model.similarity(1, 3)
+          0.73
+
+        """
+        return dot(matutils.unitvec(self.sents[sent1]), matutils.unitvec(self.sents[sent2]))
 
 
 class BrownCorpus(object):
@@ -1050,11 +1128,11 @@ if __name__ == "__main__":
         input_file = sys.argv[1]
         model_file = sys.argv[2]
         out_file = sys.argv[3]
-        model = Sent2Vec(LineSentence(input_file), model_file=model_file)
+        model = Sent2Vec(LineSentence(input_file), model_file=model_file, iteration=100)
         model.save_sent2vec_format(out_file)
     elif len(sys.argv) > 1:
         input_file = sys.argv[1]
-        model = Word2Vec(LineSentence(input_file), size=100, window=5, sg=0, min_count=5, workers=8)
+        model = Word2Vec(LineSentence(input_file), size=100, window=5, min_count=5, workers=8)
         model.save(input_file + '.model')
         model.save_word2vec_format(input_file + '.vec')
     else:
