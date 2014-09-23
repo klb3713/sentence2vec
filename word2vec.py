@@ -791,6 +791,7 @@ class Sent2Vec(utils.SaveLoad):
         self.hs = hs
         self.negative = negative
         self.cbow_mean = int(cbow_mean)
+        self.iteration = iteration
 
         if model_file and sentences:
             self.w2v = Word2Vec.load(model_file)
@@ -812,7 +813,7 @@ class Sent2Vec(utils.SaveLoad):
         for i in xrange(self.sents_len):
             self.sents[i] = (random.rand(self.layer1_size) - 0.5) / self.layer1_size
 
-    def train_sent(self, sentences, total_words=None, word_count=0, chunksize=100):
+    def train_sent(self, sentences, total_words=None, word_count=0, sent_count=0, chunksize=100):
         """
         Update the model's neural weights from a sequence of sentences (can be a once-only generator stream).
         Each sentence must be a list of unicode strings.
@@ -827,7 +828,9 @@ class Sent2Vec(utils.SaveLoad):
 
         start, next_report = time.time(), [1.0]
         word_count = [word_count]
-        total_words = total_words or int(sum(v.count * v.sample_probability for v in itervalues(self.vocab)))
+        sent_count = [sent_count]
+        total_words = total_words or sum(v.count for v in itervalues(self.vocab))
+        total_sents = self.sents_len * self.iteration
         jobs = Queue(maxsize=2 * self.workers)  # buffer ahead only a limited number of jobs.. this is the reason we can't simply use ThreadPool :(
         lock = threading.Lock()  # for shared state (=number of words trained so far, log reports...)
 
@@ -850,10 +853,11 @@ class Sent2Vec(utils.SaveLoad):
                                     for sent_no, sentence in job)
                 with lock:
                     word_count[0] += job_words
+                    sent_count[0] += chunksize
                     elapsed = time.time() - start
                     if elapsed >= next_report[0]:
-                        logger.info("PROGRESS: at %.2f%% words, alpha %.05f, %.0f words/s" %
-                                    (100.0 * word_count[0] / total_words, alpha, word_count[0] / elapsed if elapsed else 0.0))
+                        logger.info("PROGRESS: at %.2f%% sents, alpha %.05f, %.0f words/s" %
+                                    (100.0 * sent_count[0] / total_sents, alpha, word_count[0] / elapsed if elapsed else 0.0))
                         next_report[0] = elapsed + 1.0  # don't flood the log, wait at least a second between progress reports
 
         workers = [threading.Thread(target=worker_train) for _ in xrange(self.workers)]
@@ -864,8 +868,9 @@ class Sent2Vec(utils.SaveLoad):
         def prepare_sentences():
             for sent_no, sentence in enumerate(sentences):
                 # avoid calling random_sample() where prob >= 1, to speed things up a little:
-                sampled = [self.vocab[word] for word in sentence
-                           if word in self.vocab and (self.vocab[word].sample_probability >= 1.0 or self.vocab[word].sample_probability >= random.random_sample())]
+                # sampled = [self.vocab[word] for word in sentence
+                #            if word in self.vocab and (self.vocab[word].sample_probability >= 1.0 or self.vocab[word].sample_probability >= random.random_sample())]
+                sampled = [self.vocab.get(word, None) for word in sentence]
                 yield (sent_no, sampled)
 
         # convert input strings to Vocab objects (eliding OOV/downsampled words), and start filling the jobs queue
@@ -970,7 +975,7 @@ class Sent2Vec(utils.SaveLoad):
                     l1 = self.sents[sent_no]
                     neu1e = zeros(l1.shape)
 
-                    if model.hs:
+                    if self.hs:
                         # work on the entire tree at once, to push as much work into numpy's C routines as possible (performance)
                         l2a = deepcopy(model.syn1[word2.point])  # 2d matrix, codelen x layer1_size
                         fa = 1.0 / (1.0 + exp(-dot(l1, l2a.T)))  #  propagate hidden -> output
@@ -978,7 +983,7 @@ class Sent2Vec(utils.SaveLoad):
                         # model.syn1[word2.point] += outer(ga, l1)  # learn hidden -> output
                         neu1e += dot(ga, l2a) # save error
 
-                    if model.negative:
+                    if self.negative:
                         # use this word (label = 1) + `negative` other random words not from this sentence (label = 0)
                         word_indices = [word2.index]
                         while len(word_indices) < model.negative + 1:

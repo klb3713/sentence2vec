@@ -13,3 +13,6 @@ install requires:
  - 'six >= 1.2.0'
 
   [1]: https://github.com/piskvorky/gensim
+
+
+2014-9-23 update: add test files for demo.
